@@ -1,26 +1,20 @@
-# ble_proxy_mac_only.py
+# ble_proxy_dynamic_fixed.py
 import asyncio
 import json
 import base64
 import time
-import platform
 from aiohttp import web
 from bleak import BleakClient, BleakScanner, BleakError
-
-# Ensure macOS
-if platform.system() != "Darwin":
-    raise RuntimeError("❌ This script only works on macOS")
 
 BLE_CHUNK_SIZE = 120
 SCAN_TIMEOUT = 10.0
 REQUEST_TIMEOUT = 90.0
 
-# ---------- Utils ----------
 def chunk_bytes(b: bytes, n=BLE_CHUNK_SIZE):
     for i in range(0, len(b), n):
         yield b[i:i + n]
 
-# ---------- Device Selection ----------
+# 🔍 Scan and select device
 async def select_device():
     print("🔍 Scanning for nearby Bluetooth devices...")
     devices = await BleakScanner.discover(timeout=SCAN_TIMEOUT)
@@ -39,67 +33,76 @@ async def select_device():
         print("❌ Invalid selection.")
         return None
 
-# ---------- Connect and Detect ----------
+
+# ⚙️ Safe connect with retries and wait
+async def safe_connect(address, retries=3):
+    for attempt in range(retries):
+        try:
+            await asyncio.sleep(2)  # Let Windows finalize pairing
+            client = BleakClient(address, timeout=30)
+            await client.connect()
+            if client.is_connected:
+                print(f"✅ Connected on attempt {attempt + 1}")
+                await asyncio.sleep(2)
+                return client
+        except Exception as e:
+            print(f"⚠️ Attempt {attempt + 1} failed: {e}")
+            await asyncio.sleep(3)
+    raise BleakError(f"❌ Could not connect to {address} after retries")
+
+
+# 🔌 Detect characteristics for write/notify automatically
 async def detect_characteristics(address):
-    async with BleakClient(address, timeout=30) as client:
-        if not client.is_connected:
-            raise BleakError(f"❌ Could not connect to {address}")
+    client = await safe_connect(address)
+    print("✅ Detecting characteristics...")
 
-        print("✅ Connected. Detecting characteristics...")
-        await asyncio.sleep(1)  # allow macOS stack to populate services
+    await asyncio.sleep(2)  # ⚙️ Give stack time to fetch services
+    services = client.services
 
-        services = client.services
-        if not services:
-            raise RuntimeError("❌ Could not read any BLE services from device.")
+    if not services:
+        raise RuntimeError("❌ Could not read any BLE services from device.")
 
-        possible_chars = []
-        for service in services:
-            for char in service.characteristics:
-                if "write" in char.properties or "notify" in char.properties:
-                    possible_chars.append(char.uuid)
+    possible_chars = []
+    for service in services:
+        for char in service.characteristics:
+            if "write" in char.properties or "notify" in char.properties:
+                possible_chars.append(char.uuid)
 
-        if not possible_chars:
-            raise RuntimeError("❌ No suitable characteristics found.")
+    if not possible_chars:
+        raise RuntimeError("❌ No suitable characteristics found.")
 
-        cmd_char = None
-        resp_char = None
-        for char in possible_chars:
-            props = next((c.properties for s in services for c in s.characteristics if c.uuid == char), [])
-            if "write" in props and cmd_char is None:
-                cmd_char = char
-            if "notify" in props and resp_char is None:
-                resp_char = char
+    cmd_char = None
+    resp_char = None
+    for char in possible_chars:
+        props = next(
+            (c.properties for s in services for c in s.characteristics if c.uuid == char),
+            [],
+        )
+        if "write" in props and cmd_char is None:
+            cmd_char = char
+        if "notify" in props and resp_char is None:
+            resp_char = char
 
-        if not cmd_char:
-            cmd_char = possible_chars[0]
-        if not resp_char:
-            resp_char = cmd_char
+    if not cmd_char:
+        cmd_char = possible_chars[0]
+    if not resp_char:
+        resp_char = cmd_char
 
-        print(f"\n✨ CMD_CHAR: {cmd_char}")
-        print(f"✨ RESP_CHAR: {resp_char}")
-        return cmd_char, resp_char
+    print(f"\n✨ CMD_CHAR: {cmd_char}")
+    print(f"✨ RESP_CHAR: {resp_char}")
 
-# ---------- Send Command ----------
+    await client.disconnect()
+    return cmd_char, resp_char
+
+
+# 📤 Send command and get response
 async def send_command_and_get_response(address, cmd_char, resp_char, command_bytes, timeout=REQUEST_TIMEOUT):
     fragments = {}
     finished = asyncio.Event()
 
-<<<<<<< HEAD
-    # Allow decode data responses non uft-8 format
-    def notif_handler(sender, data: bytearray):
-        try:
-            try:
-                decoded = data.decode("utf-8")
-            except UnicodeDecodeError:
-                print("⚠️ Non-UTF8 notification received:", data.hex())
-                return
-
-            msg = json.loads(decoded)
-=======
     def notif_handler(sender, data: bytearray):
         try:
             msg = json.loads(data.decode("utf-8"))
->>>>>>> 90d9e0a6fc10877271e0d5cd9944657a2fa2c945
             rid = msg.get("id")
             seq = int(msg.get("seq", 0))
             payload_b64 = msg.get("payload_b64", "")
@@ -111,26 +114,38 @@ async def send_command_and_get_response(address, cmd_char, resp_char, command_by
         except Exception as e:
             print("⚠️ Notification parse error:", e)
 
-    async with BleakClient(address, timeout=30) as client:
+    # ⚙️ Reuse safe_connect to handle timing issues
+    client = await safe_connect(address)
+    try:
+        await asyncio.sleep(1)
         await client.start_notify(resp_char, notif_handler)
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(1)  # ⚙️ Let notification settle
 
         for chunk in chunk_bytes(command_bytes, BLE_CHUNK_SIZE):
             await client.write_gatt_char(cmd_char, chunk, response=True)
-            await asyncio.sleep(0.02)
+            await asyncio.sleep(0.05)
 
         print("📨 Command sent. Waiting for response...")
+
         try:
             await asyncio.wait_for(finished.wait(), timeout=timeout)
         except asyncio.TimeoutError:
             raise TimeoutError("Timed out waiting for response")
 
-        rid = json.loads(command_bytes.decode("utf-8"))["id"]
+        req_json = json.loads(command_bytes.decode("utf-8"))
+        rid = req_json["id"]
         parts = fragments.get(rid, {})
         assembled = b"".join(parts[i] for i in sorted(parts.keys()))
         return assembled
+    finally:
+        try:
+            await client.stop_notify(resp_char)
+            await client.disconnect()
+        except Exception:
+            pass
 
-# ---------- HTTP-to-BLE Proxy ----------
+
+# 🌐 HTTP-to-BLE Proxy
 async def handle_request(request):
     body = await request.read()
     req_id = f"req-{int(time.time()*1000)}"
@@ -166,7 +181,7 @@ async def handle_request(request):
     except Exception:
         return web.Response(body=resp_bytes, status=200)
 
-# ---------- Entry Point ----------
+
 connected_address = None
 CMD_CHAR = None
 RESP_CHAR = None

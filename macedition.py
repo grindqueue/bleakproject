@@ -84,7 +84,6 @@ async def send_command_and_get_response(address, cmd_char, resp_char, command_by
     fragments = {}
     finished = asyncio.Event()
 
-<<<<<<< HEAD
     # Allow decode data responses non uft-8 format
     def notif_handler(sender, data: bytearray):
         try:
@@ -95,11 +94,6 @@ async def send_command_and_get_response(address, cmd_char, resp_char, command_by
                 return
 
             msg = json.loads(decoded)
-=======
-    def notif_handler(sender, data: bytearray):
-        try:
-            msg = json.loads(data.decode("utf-8"))
->>>>>>> 90d9e0a6fc10877271e0d5cd9944657a2fa2c945
             rid = msg.get("id")
             seq = int(msg.get("seq", 0))
             payload_b64 = msg.get("payload_b64", "")
